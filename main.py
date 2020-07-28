@@ -1,49 +1,76 @@
+import datetime
 import time
 import pyscreenshot
 from PIL import Image
 import os
+import io
+import sqlite3
 
-import csv as csvlib
+db_conn = sqlite3.connect('measurements.sqlite3')
 
 class Measurement:
-	def __init__(self, current, voltage):
-		self.time = time.time()
-
+	def __init__(self, time, current, voltage, status, focused_window, screenshot = None):
+		self.time = time
 		self.current = current
 		self.voltage = voltage
+		self.status = status
 		self.power = self.current * self.voltage
-
-		# should be enough to determine what was the user doing, but without specifics
-		# e.g. youtube, reading, coding
-		#SCALE = 4
-		#self.screenshot = pyscreenshot.grab()
-		#scr_scaled_size = ( self.screenshot.size[0] // SCALE, self.screenshot.size[1] // SCALE )
-		#self.screenshot = self.screenshot.resize(scr_scaled_size)
-
-		self.focused_window = os.popen('./get_focused_window_class.py').read().strip()
+		self.focused_window = focused_window
+		self.screenshot = screenshot
 
 	def __str__(self):
-		return f'[{self.time}]: {self.power:.2f}W {self.current:.2f}A {self.voltage:.2f}V ({self.focused_window}'
+		return f'[{self.time}]: {self.power:.2f}W {self.current:.2f}A {self.voltage:.2f}V - {self.status} - ({self.focused_window})'
 
-def measure():
+def measure(take_screenshot = False):
+	curr_time = datetime.datetime.now()
 	current = float(open('/sys/class/power_supply/BATT/current_now').read()) / 1e6
 	voltage = float(open('/sys/class/power_supply/BATT/voltage_now').read()) / 1e6
-	return Measurement(current, voltage)
+	status  =       open('/sys/class/power_supply/BATT/status').read().strip()
+	focused_window = os.popen('./get_focused_window_class.sh').read().strip()
 
-csvfile = open('data.csv', mode='a')
-csv_writer = csvlib.writer(csvfile, delimiter=',', quotechar='"', quoting=csvlib.QUOTE_MINIMAL)
+	if take_screenshot:
+		# should be enough to determine what was the user doing, but without specifics
+		# e.g. youtube, reading, coding
+		SCALE = 0.20
+		scr = pyscreenshot.grab(childprocess=False, backend = "mss")
+		scaled_size = (int(scr.size[0] * SCALE), int(scr.size[1] * SCALE))
+		scr = scr.resize(scaled_size, Image.NEAREST)
+	else:
+		scr = False
 
+	return Measurement(curr_time, current, voltage, status, focused_window, scr)
+
+cnt = 0
 while True:
-	time.sleep(2)
-
 	begin = time.time()
 
-	M = measure()
-	#M.screenshot.save('asd.png')
-	csv_writer.writerow([M.time, M.power, M.current, M.power, M.focused_window])
+	take_screenshot = True if cnt % 5 == 0 else False
+
+	M = measure(take_screenshot)
 	print(M)
+
+	if take_screenshot:
+		stream = io.BytesIO()
+		M.screenshot.save(stream, format = 'jpeg', quality = 80)
+		screenshot_bytes = stream.getvalue()
+		print(len(screenshot_bytes) / 1000)
+	else:
+		screenshot_bytes = None
+
+	cur = db_conn.cursor()
+	cur.execute("""
+		INSERT INTO measurements (time, current, voltage, battery_status, focused_window, screenshot)
+		VALUES (?, ?, ?, ?, ?, ?)""",
+		(M.time, M.current, M.voltage, M.status, M.focused_window, screenshot_bytes)
+	)
+	db_conn.commit()
 
 	end = time.time()
 
 	timediff = (end - begin)
-	#print(f'took {timediff*1000:.2f}ms')
+	print(f'took {timediff*1000:.2f}ms')
+
+	sleep = 2.0 - timediff
+	if sleep > 0: time.sleep(sleep)
+	cnt += 1
+
